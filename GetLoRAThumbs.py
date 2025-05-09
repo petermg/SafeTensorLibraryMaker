@@ -46,7 +46,8 @@ def init_thumbnail_database(db_path):
                             model_url TEXT,
                             file_hash TEXT,
                             mtime REAL,
-                            blacked_out INTEGER DEFAULT 0
+                            blacked_out INTEGER DEFAULT 0,
+                            metadata TEXT
                         )
                     """)
                     conn.commit()
@@ -56,22 +57,24 @@ def init_thumbnail_database(db_path):
                         filename TEXT PRIMARY KEY,
                         model_url TEXT,
                         file_hash TEXT,
-                        mtime REAL
+                        mtime REAL,
+                        blacked_out INTEGER DEFAULT 0,
+                        metadata TEXT
                     )
                 """)
-                # Check if blacked_out column exists
+                # Check if metadata column exists
                 cursor.execute("PRAGMA table_info(thumbnails)")
                 columns = [col[1] for col in cursor.fetchall()]
-                if 'blacked_out' not in columns:
-                    logger.info(f"Adding blacked_out column to thumbnails table in {db_path}")
-                    cursor.execute("ALTER TABLE thumbnails ADD COLUMN blacked_out INTEGER DEFAULT 0")
+                if 'metadata' not in columns:
+                    logger.info(f"Adding metadata column to thumbnails table in {db_path}")
+                    cursor.execute("ALTER TABLE thumbnails ADD COLUMN metadata TEXT")
                 conn.commit()
             logger.debug("Thumbnail database initialized")
     except sqlite3.Error as e:
         logger.error(f"Error initializing database {db_path}: {e}")
         raise
 
-def save_thumbnail_to_filesystem(output_dir, cache_dir, filename, image, model_url=None, db_path=None, file_hash=None, mtime=None, blacked_out=0):
+def save_thumbnail_to_filesystem(output_dir, cache_dir, filename, image, model_url=None, db_path=None, file_hash=None, mtime=None, blacked_out=0, metadata=None):
     """Save thumbnail to filesystem and metadata to database."""
     logger.debug(f"Saving thumbnail for {filename} to {output_dir}")
     try:
@@ -80,14 +83,15 @@ def save_thumbnail_to_filesystem(output_dir, cache_dir, filename, image, model_u
         logger.info(f"Saved thumbnail for {filename} to {thumbnail_path}")
         
         if db_path:
+            metadata_json = json.dumps(metadata, indent=2) if metadata else "{}"
             with sqlite3.connect(db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT OR REPLACE INTO thumbnails (filename, model_url, file_hash, mtime, blacked_out)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (filename, model_url, file_hash, mtime, blacked_out))
+                    INSERT OR REPLACE INTO thumbnails (filename, model_url, file_hash, mtime, blacked_out, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (filename, model_url, file_hash, mtime, blacked_out, metadata_json))
                 conn.commit()
-                logger.debug(f"Saved metadata for {filename} to database with model_url: {model_url}, hash: {file_hash}, blacked_out: {blacked_out}")
+                logger.debug(f"Saved metadata for {filename} to database with model_url: {model_url}, hash: {file_hash}, blacked_out: {blacked_out}, metadata: {metadata_json}")
         return None
     except Exception as e:
         logger.error(f"Error saving thumbnail for {filename}: {e}")
@@ -102,36 +106,75 @@ def get_thumbnail_from_filesystem(output_dir, db_path, filename):
         file_hash = None
         stored_mtime = None
         blacked_out = 0
+        metadata = {}
         if thumbnail_path.exists():
             with sqlite3.connect(db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT model_url, file_hash, mtime, blacked_out FROM thumbnails WHERE filename = ?", (filename,))
+                cursor.execute("SELECT model_url, file_hash, mtime, blacked_out, metadata FROM thumbnails WHERE filename = ?", (filename,))
                 result = cursor.fetchone()
                 if result:
-                    model_url, file_hash, stored_mtime, blacked_out = result
+                    model_url, file_hash, stored_mtime, blacked_out, metadata_json = result
+                    try:
+                        metadata = json.loads(metadata_json) if metadata_json else {}
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse metadata JSON for {filename}")
+                        metadata = {}
             try:
                 thumbnail = Image.open(thumbnail_path)
-                logger.debug(f"Found thumbnail for {filename} at {thumbnail_path} with model_url: {model_url}, hash: {file_hash}, blacked_out: {blacked_out}")
-                return None, thumbnail, model_url, file_hash, stored_mtime, blacked_out
+                logger.debug(f"Found thumbnail for {filename} at {thumbnail_path} with model_url: {model_url}, hash: {file_hash}, blacked_out: {blacked_out}, metadata: {metadata}")
+                return None, thumbnail, model_url, file_hash, stored_mtime, blacked_out, metadata
             except Exception as e:
                 logger.error(f"Error opening thumbnail {thumbnail_path}: {e}")
-                return f"Error opening thumbnail {thumbnail_path}: {e}", None, None, None, None, 0
+                return f"Error opening thumbnail {thumbnail_path}: {e}", None, None, None, None, 0, {}
         logger.debug(f"No thumbnail found for {filename} at {thumbnail_path}")
-        return None, None, None, None, None, 0
+        return None, None, None, None, None, 0, {}
     except Exception as e:
         logger.error(f"Error retrieving thumbnail for {filename}: {e}")
-        return f"Error retrieving thumbnail for {filename}: {e}", None, None, None, None, 0
+        return f"Error retrieving thumbnail for {filename}: {e}", None, None, None, None, 0, {}
 
 def create_black_thumbnail(size=(200, 200)):
     """Create a black 200x200 thumbnail."""
     image = Image.new('RGB', size, color='black')
     return image
 
+def read_safetensors_metadata(file_path):
+    """Read metadata from a safetensors file."""
+    logger.debug(f"Attempting to read metadata from {file_path}")
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read(8)
+            if len(data) < 8:
+                logger.error(f"File {file_path} is too short to read header")
+                return f"Error reading {file_path}: File too short", None
+            header_size = struct.unpack('<Q', data)[0]
+            logger.debug(f"Header size: {header_size} bytes")
+            header_data = f.read(header_size)
+            if len(header_data) < header_size:
+                logger.error(f"File {file_path} has incomplete header")
+                return f"Error reading {file_path}: Incomplete header", None
+            try:
+                header_str = header_data.decode('utf-8')
+            except UnicodeDecodeError:
+                header_str = header_data.decode('utf-8', errors='replace')
+            try:
+                header_json = json.loads(header_str)
+                metadata = header_json.get("__metadata__", {})
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Metadata in {file_path} is not a dictionary: {metadata}")
+                    metadata = {"raw_metadata": str(metadata)}
+                metadata = {k: str(v) for k, v in metadata.items()}
+                logger.info(f"Parsed metadata from header in {file_path}: {metadata}")
+                return metadata
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON header in {file_path}: {e}")
+                return {}
+    except Exception as e:
+        logger.error(f"Error reading safetensors metadata from {file_path}: {e}")
+        return f"Error reading {file_path}: {e}", None
+
 def black_out_thumbnail(directory, selected_file, output_text, file_list_state):
     """Black out a thumbnail, saving original to cache."""
     logger.info(f"Blacking out thumbnail for {selected_file} in {directory}")
-    logger.debug(f"Selected file from state: {selected_file}")
-    logger.debug(f"File list state: {file_list_state}")
     try:
         if not selected_file:
             logger.warning("No file selected in gallery for black out")
@@ -147,15 +190,13 @@ def black_out_thumbnail(directory, selected_file, output_text, file_list_state):
         output_dir.mkdir(exist_ok=True)
         cache_dir.mkdir(exist_ok=True)
 
-        # Check if file exists (do not append .safetensors since filename already includes it)
         file_path = directory_path / selected_file
         if not file_path.exists():
             logger.error(f"File {file_path} does not exist")
             return f"{output_text}\nError: File {file_path} does not exist", gr.update(), file_list_state, None
 
-        # Get current thumbnail (remove .safetensors for thumbnail lookup)
         filename_base = selected_file.rsplit('.safetensors', 1)[0]
-        error, thumbnail, model_url, file_hash, stored_mtime, blacked_out = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
+        error, thumbnail, model_url, file_hash, stored_mtime, blacked_out, metadata = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
         if error:
             logger.error(error)
             return f"{output_text}\n{error}", gr.update(), file_list_state, None
@@ -166,32 +207,33 @@ def black_out_thumbnail(directory, selected_file, output_text, file_list_state):
             logger.info(f"Thumbnail for {filename_base} is already blacked out")
             return f"{output_text}\nThumbnail for {filename_base} is already blacked out", gr.update(), file_list_state, None
 
-        # Save original to cache
         cache_path = cache_dir / f"{filename_base}.png"
         thumbnail.save(cache_path, format='PNG')
         logger.debug(f"Saved original thumbnail to {cache_path}")
 
-        # Create and save black thumbnail
         black_thumbnail = create_black_thumbnail()
-        error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, black_thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=1)
+        error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, black_thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=1, metadata=metadata)
         if error:
             logger.error(error)
             return f"{output_text}\n{error}", gr.update(), file_list_state, None
 
-        # Update display items
         all_display_items = []
         for f in sorted(directory_path.glob("*.safetensors")):
-            error, thumb, url, _, _, blk = get_thumbnail_from_filesystem(output_dir, db_path, f.name.rsplit('.safetensors', 1)[0])
-            all_display_items.append((f.name, thumb, url, blk))
+            error, thumb, url, _, _, blk, meta = get_thumbnail_from_filesystem(output_dir, db_path, f.name.rsplit('.safetensors', 1)[0])
+            all_display_items.append((f.name, thumb, url, blk, meta))
         html_result = generate_html_page(all_display_items, directory_path)
         gallery_items = [
-            (resize_to_fit(img, 200), f"{name} {'(Blacked Out)' if blk else ''}")
-            for name, img, _, blk in all_display_items if img is not None
+            (
+                resize_to_fit(img, 200),
+                f"{name} {'(Blacked Out)' if blk else ''}\n---\nMetadata:\n" + (
+                    '\n'.join([f"{k}: {v}" for k, v in meta.items()]) if meta else "No metadata available"
+                )
+            )
+            for name, img, _, blk, meta in all_display_items if img is not None
         ]
 
         logger.info(f"Blacked out thumbnail for {filename_base}")
         return f"{output_text}\nBlacked out thumbnail for {filename_base}\n{html_result}", gr.update(value=gallery_items), file_list_state, None
-
     except Exception as e:
         logger.error(f"Error blacking out thumbnail for {selected_file}: {e}")
         return f"{output_text}\nError blacking out thumbnail for {selected_file}: {e}", gr.update(), file_list_state, None
@@ -199,8 +241,6 @@ def black_out_thumbnail(directory, selected_file, output_text, file_list_state):
 def restore_thumbnail(directory, selected_file, output_text, file_list_state):
     """Restore a blacked-out thumbnail from cache or re-fetch."""
     logger.info(f"Restoring thumbnail for {selected_file} in {directory}")
-    logger.debug(f"Selected file from state: {selected_file}")
-    logger.debug(f"File list state: {file_list_state}")
     try:
         if not selected_file:
             logger.warning("No file selected in gallery for restore")
@@ -215,14 +255,12 @@ def restore_thumbnail(directory, selected_file, output_text, file_list_state):
         cache_dir = output_dir / "cache"
         file_path = directory_path / selected_file
 
-        # Check if file exists
         if not file_path.exists():
             logger.error(f"File {file_path} does not exist")
             return f"{output_text}\nError: File {file_path} does not exist", gr.update(), file_list_state, None
 
-        # Check if thumbnail is blacked out (remove .safetensors for thumbnail lookup)
         filename_base = selected_file.rsplit('.safetensors', 1)[0]
-        error, thumbnail, model_url, file_hash, stored_mtime, blacked_out = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
+        error, thumbnail, model_url, file_hash, stored_mtime, blacked_out, metadata = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
         if error:
             logger.error(error)
             return f"{output_text}\n{error}", gr.update(), file_list_state, None
@@ -230,45 +268,40 @@ def restore_thumbnail(directory, selected_file, output_text, file_list_state):
             logger.info(f"Thumbnail for {filename_base} is not blacked out")
             return f"{output_text}\nThumbnail for {filename_base} is not blacked out", gr.update(), file_list_state, None
 
-        # Try to restore from cache
         cache_path = cache_dir / f"{filename_base}.png"
         if cache_path.exists():
             logger.debug(f"Restoring thumbnail from cache: {cache_path}")
             restored_thumbnail = Image.open(cache_path)
-            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, restored_thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0)
+            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, restored_thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0, metadata=metadata)
             if error:
                 logger.error(error)
                 return f"{output_text}\n{error}", gr.update(), file_list_state, None
             logger.info(f"Restored thumbnail for {filename_base} from cache")
         else:
-            # Re-fetch thumbnail
             logger.debug(f"No cached thumbnail found for {filename_base}, re-fetching")
             metadata = read_safetensors_metadata(file_path)
             if isinstance(metadata, tuple):
                 logger.warning(f"Metadata read failed: {metadata[0]}")
                 return f"{output_text}\n{metadata[0]}", gr.update(), file_list_state, None
 
-            # Try embedded thumbnail
             error, thumbnail = extract_embedded_thumbnail(metadata, file_path)
             if thumbnail:
-                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0)
+                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0, metadata=metadata)
                 if error:
                     return f"{output_text}\n{error}", gr.update(), file_list_state, None
                 logger.info(f"Restored thumbnail for {filename_base} from embedded metadata")
             else:
-                # Try thumbnail URL
                 thumbnail_url = metadata.get('ss_thumbnail_url')
                 if thumbnail_url:
                     error, thumbnail = get_thumbnail_from_url(thumbnail_url)
                     if thumbnail:
-                        error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0)
+                        error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0, metadata=metadata)
                         if error:
                             return f"{output_text}\n{error}", gr.update(), file_list_state, None
                         logger.info(f"Restored thumbnail for {filename_base} from URL")
                     else:
                         logger.warning(f"Failed to fetch thumbnail from URL: {thumbnail_url}")
                 else:
-                    # Try online search
                     hashes = []
                     if file_hash:
                         hashes.append(('file_sha256', file_hash))
@@ -280,7 +313,7 @@ def restore_thumbnail(directory, selected_file, output_text, file_list_state):
                         error, thumbnail, new_model_url = search_thumbnail_online(hashes, filename_base, file_path)
                         if thumbnail:
                             model_url = new_model_url or model_url
-                            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0)
+                            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, stored_mtime, blacked_out=0, metadata=metadata)
                             if error:
                                 return f"{output_text}\n{error}", gr.update(), file_list_state, None
                             logger.info(f"Restored thumbnail for {filename_base} from online search")
@@ -288,20 +321,23 @@ def restore_thumbnail(directory, selected_file, output_text, file_list_state):
                             logger.warning(f"No thumbnail found online for {filename_base}")
                             return f"{output_text}\nNo thumbnail found to restore for {filename_base}", gr.update(), file_list_state, None
 
-        # Update display items
         all_display_items = []
         for f in sorted(directory_path.glob("*.safetensors")):
-            error, thumb, url, _, _, blk = get_thumbnail_from_filesystem(output_dir, db_path, f.name.rsplit('.safetensors', 1)[0])
-            all_display_items.append((f.name, thumb, url, blk))
+            error, thumb, url, _, _, blk, meta = get_thumbnail_from_filesystem(output_dir, db_path, f.name.rsplit('.safetensors', 1)[0])
+            all_display_items.append((f.name, thumb, url, blk, meta))
         html_result = generate_html_page(all_display_items, directory_path)
         gallery_items = [
-            (resize_to_fit(img, 200), f"{name} {'(Blacked Out)' if blk else ''}")
-            for name, img, _, blk in all_display_items if img is not None
+            (
+                resize_to_fit(img, 200),
+                f"{name} {'(Blacked Out)' if blk else ''}\n---\nMetadata:\n" + (
+                    '\n'.join([f"{k}: {v}" for k, v in meta.items()]) if meta else "No metadata available"
+                )
+            )
+            for name, img, _, blk, meta in all_display_items if img is not None
         ]
 
         logger.info(f"Restored thumbnail for {filename_base}")
         return f"{output_text}\nRestored thumbnail for {filename_base}\n{html_result}", gr.update(value=gallery_items), file_list_state, None
-
     except Exception as e:
         logger.error(f"Error restoring thumbnail for {selected_file}: {e}")
         return f"{output_text}\nError restoring thumbnail for {selected_file}: {e}", gr.update(), file_list_state, None
@@ -317,23 +353,18 @@ def clear_old_thumbnails(directory, output_text):
         output_dir.mkdir(exist_ok=True)
         cache_dir.mkdir(exist_ok=True)
 
-        # Get current .safetensors files
         current_files = {f.name for f in directory_path.glob("*.safetensors")}
         
-        # Initialize database if not exists
         init_thumbnail_database(db_path)
         
-        # Get thumbnails in database
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT filename FROM thumbnails")
             db_thumbnails = {row[0] for row in cursor.fetchall()}
         
-        # Get thumbnails in filesystem
         fs_thumbnails = {f.stem for f in output_dir.glob("*.png")}
         cached_thumbnails = {f.stem for f in cache_dir.glob("*.png")}
         
-        # Identify and remove orphaned thumbnails
         removed_count = 0
         for filename in db_thumbnails:
             if filename not in {f.rsplit('.safetensors', 1)[0] for f in current_files}:
@@ -357,20 +388,23 @@ def clear_old_thumbnails(directory, output_text):
         
         conn.commit()
         
-        # Regenerate thumbnails.html
         all_display_items = []
         for filename in sorted(current_files):
-            error, thumbnail, model_url, _, _, blacked_out = get_thumbnail_from_filesystem(output_dir, db_path, filename.rsplit('.safetensors', 1)[0])
-            all_display_items.append((filename, thumbnail, model_url, blacked_out))
+            error, thumbnail, model_url, _, _, blacked_out, metadata = get_thumbnail_from_filesystem(output_dir, db_path, filename.rsplit('.safetensors', 1)[0])
+            all_display_items.append((filename, thumbnail, model_url, blacked_out, metadata))
         html_result = generate_html_page(all_display_items, directory_path)
         gallery_items = [
-            (resize_to_fit(img, 200), f"{name} {'(Blacked Out)' if blk else ''}")
-            for name, img, _, blk in all_display_items if img is not None
+            (
+                resize_to_fit(img, 200),
+                f"{name} {'(Blacked Out)' if blk else ''}\n---\nMetadata:\n" + (
+                    '\n'.join([f"{k}: {v}" for k, v in meta.items()]) if meta else "No metadata available"
+                )
+            )
+            for name, img, _, blk, meta in all_display_items if img is not None
         ]
 
         logger.info(f"Cleared {removed_count} old thumbnails")
         return f"{output_text}\nCleared {removed_count} old thumbnails\n{html_result}", gr.update(value=gallery_items), list(sorted(current_files)), None
-
     except Exception as e:
         logger.error(f"Error clearing old thumbnails: {e}")
         return f"{output_text}\nError clearing old thumbnails: {e}", gr.update(), [], None
@@ -389,34 +423,6 @@ def compute_file_sha256(file_path):
     except Exception as e:
         logger.error(f"Error computing SHA256 hash for {file_path}: {e}")
         return None
-
-def read_safetensors_metadata(file_path):
-    """Read metadata from a safetensors file."""
-    logger.debug(f"Attempting to read metadata from {file_path}")
-    try:
-        with open(file_path, 'rb') as f:
-            data = f.read(8)
-            if len(data) < 8:
-                logger.error(f"File {file_path} is too short to read header")
-                return f"Error reading {file_path}: File too short", None
-            header_size = struct.unpack('<Q', data)[0]
-            logger.debug(f"Header size: {header_size} bytes")
-            header_data = f.read(header_size)
-            if len(header_data) < header_size:
-                logger.error(f"File {file_path} has incomplete header")
-                return f"Error reading {file_path}: Incomplete header", None
-            metadata = json.loads(header_data.decode('utf-8'))
-            logger.debug(f"Metadata keys: {list(metadata.get('__metadata__', {}).keys())}")
-            return metadata.get('__metadata__', {})
-    except struct.error as e:
-        logger.error(f"Error reading {file_path}: {e}")
-        return f"Error reading {file_path}: {e}", None
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON in {file_path}: {e}")
-        return f"Error decoding JSON in {file_path}: {e}", None
-    except Exception as e:
-        logger.error(f"Error reading {file_path}: {e}")
-        return f"Error reading {file_path}: {e}", None
 
 def extract_embedded_thumbnail(metadata, file_path):
     """Check for embedded thumbnail in metadata."""
@@ -492,7 +498,6 @@ def search_thumbnail_online(hashes, file_name, file_path):
                     else:
                         logger.debug(f"Failed to retrieve thumbnail for {image_url}")
 
-            # Fallback to images API
             civitai_images_api = f"https://civitai.com/api/v1/images?modelId={model_id}&nsfw=X"
             logger.debug(f"Falling back to images API: {civitai_images_api}")
             response = requests.get(civitai_images_api, headers=headers, timeout=5)
@@ -521,7 +526,7 @@ def search_thumbnail_online(hashes, file_name, file_path):
     return f"No thumbnail found for {file_name}", None, None
 
 def generate_html_page(items, output_dir):
-    """Generate a static HTML page with thumbnails and Civitai links in four columns, with dark theme colors and minimal gap between title and thumbnails."""
+    """Generate a static HTML page with thumbnails, metadata, and Civitai links in four columns."""
     logger.debug(f"Generating HTML page at {output_dir / 'thumbnails.html'}")
     html_content = """
     <!DOCTYPE html>
@@ -533,29 +538,29 @@ def generate_html_page(items, output_dir):
         <style>
             body {
                 font-family: Arial, sans-serif;
-                background-color: #1A1A1A; /* Dark theme background */
-                color: #E0E0E0; /* Light gray text for body */
+                background-color: #1A1A1A;
+                color: #E0E0E0;
                 margin: 0;
                 padding: 20px;
-                padding-top: 20px; /* Small offset for title from the top */
+                padding-top: 20px;
                 min-height: 100vh;
-                text-align: center; /* Center content */
+                text-align: center;
             }
             h1 {
-                color: #E0E0E0; /* Light gray for heading */
+                color: #E0E0E0;
                 text-align: center;
-                margin-top: 0; /* Ensure no extra margin pushes it down */
-                margin-bottom: 20px; /* Small gap between title and thumbnails */
+                margin-top: 0;
+                margin-bottom: 20px;
             }
             .thumbnail-grid {
                 display: grid;
                 grid-template-columns: repeat(4, minmax(0, 1fr));
-                gap: 20px;
+                gap: 200px;
                 width: 100%;
                 max-width: 1600px;
                 margin: 0 auto;
                 justify-items: center;
-                align-items: center;
+                align-items: start;
             }
             .thumbnail-container {
                 margin: 0;
@@ -566,7 +571,7 @@ def generate_html_page(items, output_dir):
             }
             .thumbnail-container h3 {
                 margin: 10px 0;
-                color: #E0E0E0; /* Light gray for filenames */
+                color: #E0E0E0;
                 word-break: break-word;
                 max-width: 200px;
             }
@@ -574,7 +579,7 @@ def generate_html_page(items, output_dir):
                 max-width: 400px;
                 max-height: 400px;
                 object-fit: contain;
-                border: 1px solid #4A4A4A; /* Slightly lighter border for visibility on dark background */
+                border: 1px solid #4A4A4A;
                 border-radius: 4px;
             }
             .thumbnail-container a img:hover {
@@ -582,16 +587,29 @@ def generate_html_page(items, output_dir):
                 cursor: pointer;
             }
             .thumbnail-container p {
-                color: #A0A0A0; /* Slightly darker gray for secondary text */
+                color: #A0A0A0;
                 margin: 5px 0;
             }
             .thumbnail-container a {
                 text-decoration: none;
-                color: #66B0FF; /* Lighter blue for links to match dark theme */
+                color: #66B0FF;
             }
             .thumbnail-container a:hover {
                 text-decoration: underline;
-                color: #99C7FF; /* Lighter blue on hover */
+                color: #99C7FF;
+            }
+            .metadata-box {
+                max-width: 400px;
+                max-height: 200px;
+                overflow-y: auto;
+                background-color: #2A2A2A;
+                padding: 10px;
+                border: 1px solid #4A4A4A;
+                border-radius: 4px;
+                text-align: left;
+                font-size: 12px;
+                color: #E0E0E0;
+                white-space: pre-wrap;
             }
         </style>
     </head>
@@ -600,7 +618,7 @@ def generate_html_page(items, output_dir):
         <div class="thumbnail-grid">
     """
     
-    for filename, img, model_url, _ in items:
+    for filename, img, model_url, _, metadata in items:
         html_content += '<div class="thumbnail-container">'
         html_content += f'<h3>{filename}</h3>'
         if img:
@@ -615,6 +633,8 @@ def generate_html_page(items, output_dir):
             html_content += '<p>No thumbnail available</p>'
             if model_url:
                 html_content += f'<p><a href="{model_url}" target="_blank">View on Civitai</a></p>'
+        metadata_text = "\n".join([f"{k}: {v}" for k, v in metadata.items()]) if metadata else "No metadata available"
+        html_content += f'<div class="metadata-box">{metadata_text}</div>'
         html_content += '</div>'
     
     html_content += """
@@ -670,10 +690,10 @@ def process_lora_directory(directory, output_text, progress=gr.Progress()):
         model_url = None
         file_hash = None
         mtime = os.path.getmtime(file_path)
+        metadata = None
 
-        # Check filesystem and database
         filename_base = file_path.name.rsplit('.safetensors', 1)[0]
-        error, thumbnail, model_url, stored_hash, stored_mtime, blacked_out = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
+        error, thumbnail, model_url, stored_hash, stored_mtime, blacked_out, metadata = get_thumbnail_from_filesystem(output_dir, db_path, filename_base)
         if error:
             result += error + "\n"
         if thumbnail and stored_mtime == mtime and not blacked_out:
@@ -682,37 +702,34 @@ def process_lora_directory(directory, output_text, progress=gr.Progress()):
                 result += f"Retrieved Civitai model page: {model_url}\n"
             file_hash = stored_hash
             all_results.append(result)
-            all_display_items.append((file_path.name, thumbnail, model_url, blacked_out))
+            all_display_items.append((file_path.name, thumbnail, model_url, blacked_out, metadata))
             continue
 
-        # Read metadata
         metadata = read_safetensors_metadata(file_path)
         if isinstance(metadata, tuple):
             logger.warning(f"Metadata read failed: {metadata[0]}")
             result += metadata[0] + "\n"
             all_results.append(result)
-            all_display_items.append((file_path.name, None, None, 0))
+            all_display_items.append((file_path.name, None, None, 0, {}))
             continue
         else:
             result += f"Metadata read successfully\n"
             logger.debug("Metadata read successfully")
 
-        # Try embedded thumbnail
         error, thumbnail = extract_embedded_thumbnail(metadata, file_path)
         if error:
             result += error + "\n"
         if thumbnail:
             file_hash = compute_file_sha256(file_path) if not file_hash else file_hash
-            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0)
+            error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0, metadata=metadata)
             if error:
                 result += error + "\n"
             else:
                 result += f"Saved thumbnail for {file_path.name} to filesystem\n"
             all_results.append(result)
-            all_display_items.append((file_path.name, thumbnail, model_url, 0))
+            all_display_items.append((file_path.name, thumbnail, model_url, 0, metadata))
             continue
 
-        # Check for thumbnail URL in metadata
         thumbnail_url = metadata.get('ss_thumbnail_url')
         if thumbnail_url:
             logger.debug(f"Found thumbnail URL in metadata: {thumbnail_url}")
@@ -721,16 +738,15 @@ def process_lora_directory(directory, output_text, progress=gr.Progress()):
                 result += error + "\n"
             if thumbnail:
                 file_hash = compute_file_sha256(file_path) if not file_hash else file_hash
-                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0)
+                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0, metadata=metadata)
                 if error:
                     result += error + "\n"
                 else:
                     result += f"Saved thumbnail for {file_path.name} to filesystem\n"
                 all_results.append(result)
-                all_display_items.append((file_path.name, thumbnail, model_url, 0))
+                all_display_items.append((file_path.name, thumbnail, model_url, 0, metadata))
                 continue
 
-        # Try online search
         hashes = []
         file_hash = compute_file_sha256(file_path) if not file_hash else file_hash
         if file_hash:
@@ -746,7 +762,7 @@ def process_lora_directory(directory, output_text, progress=gr.Progress()):
             if error:
                 result += error + "\n"
             if thumbnail:
-                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0)
+                error = save_thumbnail_to_filesystem(output_dir, cache_dir, filename_base, thumbnail, model_url, db_path, file_hash, mtime, blacked_out=0, metadata=metadata)
                 if error:
                     result += error + "\n"
                 else:
@@ -754,22 +770,26 @@ def process_lora_directory(directory, output_text, progress=gr.Progress()):
                 if model_url:
                     result += f"Found Civitai model page: {model_url}\n"
             all_results.append(result)
-            all_display_items.append((file_path.name, thumbnail, model_url, 0))
+            all_display_items.append((file_path.name, thumbnail, model_url, 0, metadata))
             continue
 
         logger.info(f"No thumbnail or model URL found for {file_path.name}")
         result += f"No thumbnail or model URL found for {file_path.name}\n"
         all_results.append(result)
-        all_display_items.append((file_path.name, None, None, 0))
+        all_display_items.append((file_path.name, None, None, 0, metadata))
 
-    # Final result with HTML page
     all_results.append("Processing complete: All files processed.")
     html_result = generate_html_page(all_display_items, Path(directory))
     all_results.append(html_result)
     result_text = "\n".join(all_results)
     gallery_items = [
-        (resize_to_fit(img, 200), f"{name} {'(Blacked Out)' if blk else ''}")
-        for name, img, _, blk in all_display_items if img is not None
+        (
+            resize_to_fit(img, 200),
+            f"{name} {'(Blacked Out)' if blk else ''}\n---\nMetadata:\n" + (
+                '\n'.join([f"{k}: {v}" for k, v in meta.items()]) if meta else "No metadata available"
+            )
+        )
+        for name, img, _, blk, meta in all_display_items if img is not None
     ]
     files = list(sorted(f.name for f in Path(directory).glob("*.safetensors")))
     logger.info("Processing complete")
@@ -787,50 +807,46 @@ def reprocess_directory(directory, clear_thumbnails_folder, output_text, progres
     output_dir = directory_path / "thumbnails"
     cache_dir = output_dir / "cache"
 
-    # Delete existing database
     if db_path.exists():
         db_path.unlink()
         logger.debug("Deleted existing thumbnails.db")
 
-    # Optionally clear thumbnails folder
     if clear_thumbnails_folder and output_dir.exists():
         shutil.rmtree(output_dir)
         logger.debug("Deleted existing thumbnails folder")
     output_dir.mkdir(exist_ok=True)
     cache_dir.mkdir(exist_ok=True)
 
-    # Reprocess all files
     return process_lora_directory(directory, output_text, progress)
 
 def gradio_interface():
     """Create Gradio UI for LoRA thumbnail extraction with custom CSS for Dark Mode."""
     logger.debug("Initializing Gradio interface with custom CSS for Dark Mode")
     
-    # Custom CSS to enforce Dark Mode with black filename captions
     dark_mode_css = """
     .gradio-container {
-        background-color: #1A1A1A !important; /* Dark background */
-        color: #E0E0E0 !important; /* Light text */
+        background-color: #1A1A1A !important;
+        color: #E0E0E0 !important;
     }
     .block, .block .inner, .block .content {
         background-color: #1A1A1A !important;
         color: #E0E0E0 !important;
     }
     h1, h2, h3, h4, h5, h6, label {
-        color: #E0E0E0 !important; /* Light headers and labels */
+        color: #E0E0E0 !important;
     }
     .block input, .block textarea, .block select {
-        background-color: #2A2A2A !important; /* Dark input fields */
+        background-color: #2A2A2A !important;
         color: #E0E0E0 !important;
         border: 1px solid #4A4A4A !important;
     }
     .block button {
-        background-color: #4A4A4A !important; /* Dark buttons */
+        background-color: #4A4A4A !important;
         color: #E0E0E0 !important;
         border: 1px solid #666666 !important;
     }
     .block button:hover {
-        background-color: #666666 !important; /* Lighter on hover */
+        background-color: #666666 !important;
     }
     .gallery-item, .gallery .inner {
         background-color: #1A1A1A !important;
@@ -839,10 +855,12 @@ def gradio_interface():
         border: 1px solid #4A4A4A !important;
     }
     .gallery-item .caption, .gallery .caption {
-        color: #000000 !important; /* Black caption text for filenames */
-        background-color: rgba(255, 255, 255, 0.7) !important; /* Optional light background for readability */
+        color: #000000 !important;
+        background-color: rgba(255, 255, 255, 0.7) !important;
         padding: 2px 5px !important;
         margin: 0 !important;
+        white-space: pre-wrap !important;
+        font-size: 12px !important;
     }
     """
     
@@ -853,9 +871,10 @@ def gradio_interface():
                 captions.forEach(caption => {
                     caption.style.color = '#000000';
                     caption.style.backgroundColor = 'rgba(255, 255, 255, 0.7)';
+                    caption.style.whiteSpace = 'pre-wrap';
+                    caption.style.fontSize = '12px';
                 });
             }
-            // Run on page load and when gallery updates
             window.addEventListener('load', setCaptionColor);
             const observer = new MutationObserver(setCaptionColor);
             observer.observe(document.body, { childList: true, subtree: true });
@@ -871,7 +890,20 @@ def gradio_interface():
         output_text = gr.Textbox(label="Processing Log", lines=10)
         
         gr.Markdown("## Thumbnails (Click an image to select)")
-        gallery = gr.Gallery(label="Thumbnails", columns=4, rows=3, object_fit="contain", height="auto", allow_preview=True)
+        gallery = gr.Gallery(
+            label="Thumbnails",
+            columns=4,
+            rows=3,
+            object_fit="contain",
+            height="auto",
+            allow_preview=True,
+            elem_classes=["gallery"],
+            show_label=True,
+            show_share_button=False,
+            show_download_button=False,
+            preview=True,
+            format="png",
+        )
         file_list_state = gr.State(value=[])
         selected_file_state = gr.State(value=None)
         with gr.Row():
@@ -885,7 +917,6 @@ def gradio_interface():
 
         def update_display(directory, output_text, progress=gr.Progress()):
             result, files, gallery_update, selected_file_update = process_lora_directory(directory, output_text, progress)
-            html_path = Path(directory) / "thumbnails.html"
             return result, files, gallery_update, selected_file_update
 
         def clear_thumbnails(directory, output_text):
@@ -908,14 +939,13 @@ def gradio_interface():
             selected_file = None
             if evt.index is not None and isinstance(evt.value, dict) and 'caption' in evt.value:
                 caption = evt.value['caption']
-                # Extract filename from caption, removing '(Blacked Out)' if present and trimming whitespace
-                selected_file = caption.split(' (Blacked Out)')[0].strip() if '(Blacked Out)' in caption else caption.strip()
+                # Extract the filename from the caption (before the metadata separator)
+                selected_file = caption.split('\n---\n')[0].strip().split(' (Blacked Out)')[0].strip()
                 logger.debug(f"Selected file from gallery: {selected_file}")
             else:
                 logger.warning(f"Invalid gallery selection data: {evt.value}")
             return selected_file
 
-        # Bind event handlers
         api_key_input.change(
             fn=set_api_key,
             inputs=[api_key_input, output_text],
